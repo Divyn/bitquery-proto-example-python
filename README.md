@@ -14,3 +14,6 @@ pip install bitquery-pb2-kafka-package
 - Latest Token Creation on Pumpfun
 - Latest Trades of a token on Solana
 - Latest Trades on Ethereum
+
+
+Code samples, also published https://github.com/bitquery/streaming-protobuf-python/tree/main
