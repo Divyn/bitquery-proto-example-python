@@ -16,7 +16,7 @@ def process_message(message):
             for instruction in tx.ParsedIdlInstructions:
                 # collect logs
                 if instruction.Logs:
-                    tx_logs.extend(instruction.Logs)
+                    # tx_logs.extend(instruction.Logs) save logs for all tx if needed
                     
                     # Check if this instruction is from Pump.fun migrate program
                     if base58.b58encode(instruction.Program.Address).decode() == PUMPFUN_MIGRATE_PROGRAM_ID:
