@@ -1,104 +1,122 @@
-import json
+# -*- coding: utf-8 -*-
+import logging
+import threading
 import os
-from confluent_kafka import Consumer, KafkaError, KafkaException
-import uuid
-from google.protobuf.message import DecodeError
-from solana import parsed_idl_block_message_pb2, token_block_message_pb2
 import base58
+from confluent_kafka import Consumer
+from google.protobuf.message import DecodeError
+from queue import Queue, Empty
+
 import config
+from solana import token_block_message_pb2
 
-group_id_suffix = uuid.uuid4().hex
+# Constants
+SPL_TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+SPL_TOKEN_PROGRAM_ID_BYTES = base58.b58decode(SPL_TOKEN_PROGRAM_ID)
+INITIALIZE_MINT_PREFIX = b"\x00\x00\x00\x00"
+TARGET_METHODS = {"initialize", "initializePosition", "create"}
 
-# Kafka consumer configuration
-conf = {
-    'bootstrap.servers': 'rpk0.bitquery.io:9092,rpk1.bitquery.io:9092,rpk2.bitquery.io:9092',
-    'group.id': f'{config.solana_username}-group-{group_id_suffix}',  
-    'session.timeout.ms': 30000,
-    'security.protocol': 'SASL_PLAINTEXT',
-    'ssl.endpoint.identification.algorithm': 'none',
-    'sasl.mechanisms': 'SCRAM-SHA-512',
-    'sasl.username': config.solana_username,
-    'sasl.password': config.solana_password,
-    'auto.offset.reset': 'latest',
-}
+# Shared queue and state
+message_queue = Queue()
+deduped_keys = set()
+dedup_lock = threading.Lock()
 
-# Initialize Kafka consumer
-consumer = Consumer(conf)
-topic = 'solana.tokens.proto'
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - [%(levelname)s] - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
-# Target program address to filter transactions
-TARGET_PROGRAM_ADDRESS = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj"
+def create_consumer() -> Consumer:
+    conf = {
+        'bootstrap.servers': config.KAFKA_BOOTSTRAP_SERVERS,
+        'group.id': config.KAFKA_GROUP_ID,
+        'session.timeout.ms': 30000,
+        'security.protocol': 'SASL_PLAINTEXT',
+        'ssl.endpoint.identification.algorithm': 'none',
+        'sasl.mechanisms': 'SCRAM-SHA-512',
+        'sasl.username': config.KAFKA_USERNAME,
+        'sasl.password': config.KAFKA_PASSWORD,
+        'auto.offset.reset': 'latest',
+        'client.id': f"{config.KAFKA_USERNAME}-{os.getpid()}"
+    }
+    return Consumer(conf)
 
-# Target method
-TARGET_METHOD = "initialize"
+def quick_relevance_check(payload: bytes) -> bool:
+    return SPL_TOKEN_PROGRAM_ID_BYTES in payload
 
-def process_message(message):
+def process_kafka_message(payload: bytes, _):
     try:
-        buffer = message.value()
         tx_block = token_block_message_pb2.TokenBlockMessage()
-        tx_block.ParseFromString(buffer)
-
-        print("\nNew Block Message Received")
-
-        # Block Header
-        if tx_block.HasField("Header"):
-            header = tx_block.Header
-            print(f"Block Slot: {header.Slot}")
-            print(f"Block Hash: {base58.b58encode(header.Hash).decode()}")
-            print(f"Timestamp: {header.Timestamp}")
+        tx_block.ParseFromString(memoryview(payload))
+        block_slot = tx_block.Header.Slot if tx_block.HasField("Header") else -1
 
         for tx in tx_block.Transactions:
-            include_transaction = False
-
             for instr_update in tx.InstructionBalanceUpdates:
                 instr = instr_update.Instruction
-                if not instr.HasField("Program"):
+                method = instr.Program.Method
+
+                if method not in TARGET_METHODS:
                     continue
 
-                program = instr.Program
-                program_address = base58.b58encode(program.Address).decode()
-                method = program.Method
+                for bal_update in instr_update.TotalCurrencyBalanceUpdates:
+                    mint_bytes = bal_update.Currency.MintAddress
+                    mint_address = base58.b58encode(mint_bytes).decode().strip()
 
-                if (
-                    program_address ==TARGET_PROGRAM_ADDRESS
-                    and method == TARGET_METHOD
-                ):
-                    for bal_update in instr_update.TotalCurrencyBalanceUpdates:
-                        mint_address = base58.b58encode(bal_update.Currency.MintAddress).decode()
-                        if mint_address.endswith("bonk"):
-                            include_transaction = True
-                            break
-                if include_transaction:
-                    break
+                    if not mint_address.lower().endswith("bonk"):
+                        continue
 
-            if include_transaction:
-                print("\nMatching Transaction Details:")
-                print(f"Transaction Signature: {base58.b58encode(tx.Signature).decode()}")
-                print(f"Transaction Index: {tx.Index}")
+                    tx_signature = base58.b58encode(tx.Signature).decode().strip()
+                    dedup_key = f"{mint_address}:{block_slot}"
+                    with dedup_lock:
+                        if dedup_key in deduped_keys:
+                            return
+                        deduped_keys.add(dedup_key)
 
-    except DecodeError as err:
-        print(f"Protobuf decoding error: {err}")
-    except Exception as err:
-        print(f"Error processing message: {err}")
+                    logging.info("✅ New token mint detected")
+                    logging.info(f"   - Mint: https://solscan.io/token/{mint_address}")
+                    logging.info(f"   - Tx: https://solscan.io/tx/{tx_signature}")
+                    logging.info(f"   - Slot: {block_slot}")
+                    return
+    except DecodeError:
+        logging.error("Protobuf decode error", exc_info=True)
+    except Exception:
+        logging.error("Unexpected error", exc_info=True)
 
-# Subscribe to the topic
-consumer.subscribe([topic])
-
-# Poll messages and process them
-try:
-    while True:
-        msg = consumer.poll(timeout=1.0)
-        if msg is None:
-            continue
-        if msg.error():
-            if msg.error().code() == KafkaError._PARTITION_EOF:
+def message_consumer():
+    consumer = create_consumer()
+    consumer.subscribe([config.KAFKA_TOPIC])
+    try:
+        while True:
+            messages = consumer.consume(num_messages=500, timeout=0.05)
+            if not messages:
                 continue
-            else:
-                raise KafkaException(msg.error())
-        process_message(msg)
+            for msg in messages:
+                if msg is None or msg.error():
+                    continue
+                payload = msg.value()
+                if not quick_relevance_check(payload):
+                    continue
+                message_queue.put((payload, None))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        consumer.close()
 
-except KeyboardInterrupt:
-    pass
+def message_processor():
+    while True:
+        try:
+            payload, _ = message_queue.get(timeout=1)
+            process_kafka_message(payload, None)
+        except Empty:
+            continue
+        except Exception:
+            logging.exception("Error in message processor")
 
-finally:
-    consumer.close()
+def run_bot():
+    threading.Thread(target=message_processor, daemon=True).start()
+    message_consumer()
+
+if __name__ == "__main__":
+    run_bot()
