@@ -1,5 +1,5 @@
 """
-Solana DEX trade filter (optimized)
+Solana DEX trade filter 
 
 Key features:
 - Manual partition assignment (no group/rebalances).
