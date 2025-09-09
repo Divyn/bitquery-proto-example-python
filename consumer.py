@@ -1,5 +1,5 @@
 """
-Solana transaction display (optimized)
+Solana transaction display
 
 Key features:
 - Manual partition assignment (no group/rebalances).
